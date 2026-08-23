@@ -1,6 +1,5 @@
 """Bulk binary codecs for the Python declarative layer."""
 
-from std.algorithm import parallelize
 from std.memory import stack_allocation
 from std.sys import simd_width_of
 
@@ -8,8 +7,6 @@ comptime BPtr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
 comptime U64Ptr = UnsafePointer[UInt64, AnyOrigin[mut=True]]
 comptime F64Ptr = UnsafePointer[Float64, AnyOrigin[mut=True]]
 comptime I64Ptr = UnsafePointer[Int64, AnyOrigin[mut=True]]
-comptime PARALLEL_ENCODE_THRESHOLD = 4_000_000
-comptime ENCODE_WORKERS = 4
 
 
 def swap16(v: UInt16) -> UInt16:
@@ -197,16 +194,7 @@ def encode_ints(
         return
     var src = U64Ptr(unsafe_from_address=src_addr)
     var dst = BPtr(unsafe_from_address=dst_addr)
-    if count >= PARALLEL_ENCODE_THRESHOLD and stride == width:
-        @parameter
-        def work(chunk: Int):
-            var start = chunk * count // ENCODE_WORKERS
-            var end = (chunk + 1) * count // ENCODE_WORKERS
-            encode_ints_range(src, dst, start, end, width, stride, big)
-
-        parallelize[work](ENCODE_WORKERS, ENCODE_WORKERS)
-    else:
-        encode_ints_range(src, dst, 0, count, width, stride, big)
+    encode_ints_range(src, dst, 0, count, width, stride, big)
 
 
 @export("mc_decode_floats")
