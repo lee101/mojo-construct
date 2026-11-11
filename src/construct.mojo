@@ -178,30 +178,47 @@ def decode_ints(
         (UInt64(1) << UInt64(width * 8)) - UInt64(1)
     )
     var i = 0
+    comptime W = simd_width_of[DType.uint64]()
     if width == 4 and not big and not signed and stride == width:
-        # Little-endian 32-bit unsigned: one widen per element.
-        while i < count:
-            dst.unsafe_store(i, UInt64(src.bitcast[UInt32]().unsafe_load[alignment=1](i)))
-            i += 1
-    elif width == 1 and not signed and stride == width:
-        # Byte arrays: the element address is the index, so no multiply.
-        while i < count:
-            dst.unsafe_store(i, UInt64(src.unsafe_load(i)))
-            i += 1
-    elif width == 2 and stride == width:
-        # Swap 8 values at a time in vector registers, then widen from the
-        # registers: 3 SIMD ops per 8 values instead of per value.
-        comptime W = 8
+        # Little-endian 32-bit unsigned: widen straight into 64-bit lanes.
+        var source = src.bitcast[UInt32]()
         var vector_end = count - count % W
         while i < vector_end:
-            # A width-8 load on a UInt16 pointer reads 8 bytes, not 8 values.
-            var v = src.unsafe_load[width=W](i * 2).cast[DType.uint16]()
+            dst.store(i, source.unsafe_load[width=W, alignment=1](i).cast[DType.uint64]())
+            i += W
+        while i < count:
+            dst.store(i, UInt64(source.unsafe_load[alignment=1](i)))
+            i += 1
+    elif width == 1 and not signed and stride == width:
+        # Byte arrays: the element address is the index, so no multiply. Widen
+        # W bytes per vector round and store one vector of 64-bit lanes.
+        var vector_end = count - count % W
+        while i < vector_end:
+            dst.store(i, src.unsafe_load[width=W](i).cast[DType.uint64]())
+            i += W
+        while i < count:
+            dst.store(i, UInt64(src.unsafe_load(i)))
+            i += 1
+    elif width == 2 and stride == width:
+        # Swap and widen W values per round in vector registers: the widening
+        # happens on the vector, not lane by lane as before.
+        var source = src.bitcast[UInt16]()
+        var vector_end = count - count % W
+        var low_mask = SIMD[DType.uint64, W](sign_mask)
+        while i < vector_end:
+            var v = source.unsafe_load[width=W, alignment=1](i)
             if big:
                 v = (v << 8) | (v >> 8)
-            for lane in range(W):
-                dst.unsafe_store(
-                    i + lane, extend16(UInt16(v[lane]), signed, sign_bit, sign_mask)
-                )
+            var wide = v.cast[DType.uint64]()
+            if signed:
+                # sign_mask is an or-mask applied only where the sign bit is
+                # set: shifting the 16-bit lane left to 64 and back arithmetically
+                # leaves all ones there and zero elsewhere.
+                var negative = (
+                    v.cast[DType.int64]() << Int64(64 - 16) >> Int64(64 - 1)
+                ).cast[DType.uint64]()
+                wide |= negative & low_mask
+            dst.store(i, wide)
             i += W
         while i < count:
             var v = src.bitcast[UInt16]().unsafe_load[alignment=1](i)
@@ -256,27 +273,66 @@ def decode_floats(
         return
     var src = BPtr(unsafe_from_address=src_addr)
     var dst = F64Ptr(unsafe_from_address=dst_addr)
+    # One scratch word: reinterpretation of raw bits as a float, matching the
+    # scalar path's (payload-preserving) behaviour.
     var scratch = stack_allocation[1, DType.uint64]()
-    for i in range(count):
-        var p = src + i * stride
+    comptime W = simd_width_of[DType.float64]()
+    var i = 0
+    if stride == width and width == 8:
+        # 64-bit float: swap, reinterpret and store in one fused pass. Loads are
+        # unaligned because the caller hands us a bytes object's address.
+        var source = src.bitcast[UInt64]()
+        var target = dst.bitcast[UInt64]()
+        var vector_end = count - count % W
+        while i < vector_end:
+            var values = source.unsafe_load[width=W, alignment=1](i)
+            if big:
+                values = (
+                    (values << 56)
+                    | ((values << 40) & 0x00FF000000000000)
+                    | ((values << 24) & 0x0000FF0000000000)
+                    | ((values << 8) & 0x000000FF00000000)
+                    | ((values >> 8) & 0x00000000FF000000)
+                    | ((values >> 24) & 0x0000000000FF0000)
+                    | ((values >> 40) & 0x000000000000FF00)
+                    | (values >> 56)
+                )
+            target.unsafe_store[width=W](i, values)
+            i += W
+    elif stride == width and width == 4:
+        # 32-bit float widened to 64-bit: swap the raw bits, reinterpret as
+        # float32 and widen in registers, one input read and one output write.
+        comptime R = simd_width_of[DType.float32]()
+        var source = src.bitcast[UInt32]()
+        var lanes = stack_allocation[R, DType.uint32]()
+        var as_float = lanes.bitcast[Float32]()
+        var vector_end = count - count % R
+        while i < vector_end:
+            var raw = source.unsafe_load[width=R, alignment=1](i)
+            if big:
+                raw = (
+                    (raw << 24)
+                    | ((raw << 8) & 0x00FF0000)
+                    | ((raw >> 8) & 0x0000FF00)
+                    | (raw >> 24)
+                )
+            lanes.unsafe_store[width=R](0, raw)
+            dst.unsafe_store[width=R](
+                i, as_float.unsafe_load[width=R](0).cast[DType.float64]()
+            )
+            i += R
+    for j in range(i, count):
+        var p = src.unsafe_offset(j * stride)
+        var raw = UInt64(0)
         if width == 4:
-            if big:
-                var raw = swap32(p.bitcast[UInt32]().unsafe_load[alignment=1]())
-                scratch.bitcast[UInt32]()[0] = raw
-                dst[i] = Float64(
-                    scratch.bitcast[Float32]()[0]
-                )
-            else:
-                dst[i] = Float64(
-                    p.bitcast[Float32]().unsafe_load[alignment=1]()
-                )
+            var v = p.bitcast[UInt32]().unsafe_load[alignment=1](0)
+            raw = UInt64(swap32(v) if big else v)
+            scratch.bitcast[UInt32]()[0] = UInt32(raw)
+            dst.unsafe_store(j, Float64(scratch.bitcast[Float32]()[0]))
         elif width == 8:
-            if big:
-                var raw = swap64(p.bitcast[UInt64]().unsafe_load[alignment=1]())
-                scratch[0] = raw
-                dst[i] = scratch.bitcast[Float64]()[0]
-            else:
-                dst[i] = p.bitcast[Float64]().unsafe_load[alignment=1]()
+            var v = p.bitcast[UInt64]().unsafe_load[alignment=1](0)
+            scratch[0] = swap64(v) if big else v
+            dst.unsafe_store(j, scratch.bitcast[Float64]()[0])
 
 
 @export("mc_encode_floats")
@@ -292,18 +348,59 @@ def encode_floats(
         return
     var src = F64Ptr(unsafe_from_address=src_addr)
     var dst = BPtr(unsafe_from_address=dst_addr)
-    for i in range(count):
-        var p = dst + i * stride
-        if width == 4:
-            p.bitcast[Float32]().store[alignment=1](0, Float32(src[i]))
+    comptime W = simd_width_of[DType.float64]()
+    var i = 0
+    if stride == width and width == 8:
+        # No per-element narrowing for 64-bit output: copy (and swap) as bits.
+        var source = src.bitcast[UInt64]()
+        var target = dst.bitcast[UInt64]()
+        var vector_end = count - count % W
+        while i < vector_end:
+            var values = source.unsafe_load[width=W](i)
             if big:
-                var raw = p.bitcast[UInt32]().unsafe_load[alignment=1]()
-                p.bitcast[UInt32]().store[alignment=1](0, swap32(raw))
-        elif width == 8:
-            p.bitcast[Float64]().store[alignment=1](0, src[i])
+                values = (
+                    (values << 56)
+                    | ((values << 40) & 0x00FF000000000000)
+                    | ((values << 24) & 0x0000FF0000000000)
+                    | ((values << 8) & 0x000000FF00000000)
+                    | ((values >> 8) & 0x00000000FF000000)
+                    | ((values >> 24) & 0x0000000000FF0000)
+                    | ((values >> 40) & 0x000000000000FF00)
+                    | (values >> 56)
+                )
+            target.unsafe_store[width=W](i, values)
+            i += W
+    elif stride == width and width == 4:
+        # Narrow double -> float in registers and write each element once.
+        comptime R = simd_width_of[DType.float32]()
+        var lanes = stack_allocation[R, DType.uint32]()
+        var target = dst.bitcast[UInt32]()
+        var vector_end = count - count % R
+        while i < vector_end:
+            var raw = src.unsafe_load[width=R](i).cast[DType.float32]()
+            lanes.bitcast[Float32]().unsafe_store[width=R](0, raw)
+            var bits = lanes.unsafe_load[width=R](0)
             if big:
-                var raw = p.bitcast[UInt64]().unsafe_load[alignment=1]()
-                p.bitcast[UInt64]().store[alignment=1](0, swap64(raw))
+                bits = (
+                    (bits << 24)
+                    | ((bits << 8) & 0x00FF0000)
+                    | ((bits >> 8) & 0x0000FF00)
+                    | (bits >> 24)
+                )
+            target.unsafe_store[width=R](i, bits)
+            i += R
+    if i < count:
+        var scratch = stack_allocation[1, DType.uint64]()
+        for j in range(i, count):
+            var p = dst.unsafe_offset(j * stride)
+            if width == 4:
+                scratch.bitcast[Float32]()[0] = Float32(src.unsafe_load(j))
+                var raw = scratch.bitcast[UInt32]()[0]
+                p.bitcast[UInt32]().store[alignment=1](0, swap32(raw) if big else raw)
+            elif width == 8:
+                scratch.bitcast[Float64]()[0] = src.unsafe_load(j)
+                var raw = scratch[0]
+                p.bitcast[UInt64]().store[alignment=1](0, swap64(raw) if big else raw)
 
 
 @export("mc_decode_varints")

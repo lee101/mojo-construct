@@ -96,7 +96,7 @@ Coverage includes boundary values for every accelerated integer type, random
 nested schemas, bit structs, adapters, raw copies, and checksums.
 
 ```text
-62 passed
+434 passed
 ```
 
 ## Benchmarks
@@ -135,6 +135,59 @@ The kernels themselves did get faster. Timed on preallocated buffers with
 |---|---:|---:|
 | parse 1M Int32ul | 1.63 ms | 0.59 ms |
 | parse 1.5M Byte | 2.43 ms | 0.75 ms |
+
+### SIMD and fusion phase
+
+This phase vectorised the remaining contiguous loops and fused the adjacent
+passes that touched the same data. Kernel-only numbers below are medians of 15
+alternating A/B runs of the previous build and this one, on the same buffers, so
+the two libraries see the same machine load (load average was 21-23 during the
+runs):
+
+| Kernel (kernel-only) | before | after | change |
+|---|---:|---:|---:|
+| parse 1M Int32ul | 0.590 ms | 0.540 ms | -8.6% |
+| parse 750k Float64b | 0.576 ms | 0.501 ms | -13.1% |
+| build 750k Float64b | 0.586 ms | 0.500 ms | -14.7% |
+| parse 1.5M Byte | 0.785 ms | 0.699 ms | -10.9% |
+
+What changed:
+
+- Float decode and encode are now one fused pass each: byte swap, bit
+  reinterpretation and (for 32-bit) widening happen in vector registers, then
+  each element is written once. Float encode previously stored, reloaded and
+  re-stored every element to byte-swap it; that second pass is gone.
+- Byte and unsigned little-endian 32-bit decode widen `uint8`/`uint32` to
+  `uint64` in vector lanes instead of one scalar widen per element.
+- 16-bit decode swaps and widens a whole vector per round instead of widening
+  lane by lane in a scalar inner loop.
+- The 16-bit decode vector path also had a pre-existing bug: it wrote lanes to
+  the wrong elements (holes and duplicated values from index 8 on), which the
+  old parity tests never exercised. It is fixed, and the new length tests pin it.
+
+Vector loads are `alignment=1`. The Python caller passes a `bytes` object's
+address and a NumPy result buffer, neither of which carries an alignment
+guarantee, so an aligned load would be unsound. Each vector path is followed by
+a scalar tail.
+
+Caller-level rows from `pixi run bench` (best of five, three runs of each build,
+load average 16-23):
+
+| Case | before | after |
+|---|---:|---:|
+| parse Array(1M, Int32ul) | 63.76-68.42 ms | 64.08-65.60 ms |
+| build Array(1M, Int32ul) | 78.64-80.51 ms | 77.31-78.43 ms |
+| parse Array(750k, Float64b) | 33.37-37.32 ms | 30.66-36.20 ms |
+| build Array(750k, Float64b) | 42.82-44.84 ms | 41.06-41.61 ms |
+| parse Array(1.5M, Byte) | 18.84-20.23 ms | 18.25-21.25 ms |
+| parse Array(500k, VarInt) | 16.29-24.40 ms | 17.91-20.15 ms |
+| build Array(500k, VarInt) | 84.16-102.71 ms | 85.18-89.10 ms |
+
+No row regressed beyond its own noise. Float build moved consistently; float
+parse moved on the median but one sample overlaps the old range, which is the
+caller noise the section above describes. The VarInt kernels were not
+vectorised: their inner loops advance by a data-dependent amount, so iterations
+depend on each other.
 
 Those wins are a small part of the rows because the rows are dominated by the
 Python caller: converting the decoded 1M items with `.tolist()` alone costs about
@@ -176,11 +229,12 @@ conversion, and writes into that caller-owned array. Building reverses the
 process into a caller-owned byte array. Varints use the same layout plus a
 two-word metadata buffer for consumed bytes and decoded count.
 
-Decoding chooses one branch per call instead of testing the width per element:
-unsigned little-endian 32-bit and unsigned 8-bit decode with a typed pointer
-view and no per-element multiply, and 16-bit decode swaps eight values per
-round in vector registers before widening. Sign bit and sign-extension mask are
-computed once per call. Integer-array builds convert and range-check input with
+Decoding chooses one branch per call instead of testing the width per element.
+Unsigned 8-bit and unsigned little-endian 32-bit decode read one vector of
+narrow lanes and widen in the vector; 16-bit decode swaps and widens a vector
+per round and applies sign extension to the widened lanes; float decode swaps
+and reinterprets (or widens) in registers and writes each element once. Sign bit
+and sign-extension mask are computed once per call. Integer-array builds convert and range-check input with
 NumPy once, preserving already-contiguous 64-bit arrays without a copy across
 the FFI boundary. The Mojo encoder uses host-width SIMD for 8-, 16-, 32-, and
 64-bit fields, followed by a scalar tail. Contiguous arrays of at least four

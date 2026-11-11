@@ -292,6 +292,105 @@ def test_bitstruct_parity():
     assert ours.sizeof() == theirs.sizeof() == 2
 
 
+# Lengths that exercise the vector body and the scalar tail of every SIMD path:
+# 0, 1, W-1, W, W+1 for each width in use (4 for 64-bit lanes, 8 for 32-bit
+# lanes, 32 for byte lanes), plus a large odd count.
+SIMD_TAIL_LENGTHS = [0, 1, 3, 4, 5, 7, 8, 9, 31, 32, 33, 1001]
+
+
+@pytest.mark.parametrize("count", SIMD_TAIL_LENGTHS)
+@pytest.mark.parametrize(
+    "name", ["Byte", "Int16ub", "Int16sb", "Int16ul", "Int32ub", "Int32ul",
+             "Int64ul", "Int64sb"]
+)
+def test_simd_integer_decode_tails_match_upstream(name, count):
+    rng = random.Random(count)
+    ours, theirs = getattr(mc, name), getattr(ref, name)
+    bits = ours.sizeof() * 8
+    signed = name.endswith(("sb", "sl"))
+    low = -(1 << (bits - 1)) if signed else 0
+    high = (1 << (bits - (1 if signed else 0))) - 1
+    values = [rng.randint(low, high) for _ in range(count)]
+    blob = theirs[count].build(values)
+    assert ours[count].parse(blob) == values
+    assert ours[count].build(values) == blob
+
+
+@pytest.mark.parametrize("count", SIMD_TAIL_LENGTHS)
+@pytest.mark.parametrize(
+    "name",
+    ["Float16b", "Float16l", "Float32b", "Float32l", "Float32n",
+     "Float64b", "Float64l", "Float64n"],
+)
+def test_simd_float_tails_match_upstream(name, count):
+    rng = random.Random(1000 + count)
+    ours, theirs = getattr(mc, name), getattr(ref, name)
+    # Magnitudes a Float16 can hold exactly enough to survive the round trip;
+    # half precision is one of the covered widths.
+    values = [rng.uniform(-1000, 1000) for _ in range(count)]
+    blob = theirs[count].build(values)
+    assert ours[count].build(values) == blob
+    # Compare against Construct's own decode: narrower widths round, so the
+    # original Python floats are not the expected values.
+    assert ours[count].parse(blob) == theirs[count].parse(blob)
+
+
+@pytest.mark.parametrize("count", SIMD_TAIL_LENGTHS)
+@pytest.mark.parametrize("width", [1, 2, 3, 4, 8])
+@pytest.mark.parametrize("big", [False, True])
+def test_ffi_integer_decode_tails_cover_every_width(width, big, count):
+    rng = np.random.default_rng(count * 10 + width + big)
+    raw = rng.integers(0, 256, size=max(1, count * width), dtype=np.uint8)
+    for signed in ((False, True) if width in (2, 3, 4) else (False,)):
+        result = _lib.decode_ints(raw, count, width, big=big, signed=signed)
+        dtype = (">" if big else "<") + ("i" if signed else "u")
+        if width == 3:
+            expected = []
+            for index in range(count):
+                chunk = raw[index * 3:index * 3 + 3].tolist()
+                chunk = chunk[::-1] if big else chunk
+                value = chunk[0] | (chunk[1] << 8) | (chunk[2] << 16)
+                if signed and value & 0x800000:
+                    value -= 1 << 24
+                expected.append(value)
+            assert result.tolist() == expected
+            continue
+        expected = np.frombuffer(
+            raw[:count * width].tobytes(), dtype=f"{dtype}{width}"
+        ).astype(np.int64 if signed else np.uint64)
+        assert result.tolist() == expected.tolist()
+
+
+@pytest.mark.parametrize("count", SIMD_TAIL_LENGTHS)
+@pytest.mark.parametrize("width", [4, 8])
+@pytest.mark.parametrize("big", [False, True])
+def test_ffi_float_tails_cover_both_widths(width, big, count):
+    rng = np.random.default_rng(count * 3 + width + big)
+    values = rng.uniform(-1000, 1000, size=count)
+    encoded = _lib.encode_floats(values, width, big=big)
+    dtype = (">" if big else "<") + f"f{width}"
+    assert encoded == values.astype(dtype).tobytes()
+    decoded = _lib.decode_floats(encoded, count, width, big=big)
+    assert decoded.tolist() == values.astype(dtype).astype(np.float64).tolist()
+
+
+@pytest.mark.parametrize("count", SIMD_TAIL_LENGTHS)
+def test_simd_float_tails_preserve_nan_and_signed_zero(count):
+    values = ([-0.0, float("inf"), float("-inf")]
+              + [float("nan"), 1.5, -2.25] * 200)[:count]
+    for name in ("Float32b", "Float32l", "Float64b", "Float64l"):
+        ours, theirs = getattr(mc, name), getattr(ref, name)
+        blob = theirs[len(values)].build(values)
+        assert ours[len(values)].build(values) == blob
+        parsed = ours[len(values)].parse(blob)
+        expected = theirs[len(values)].parse(blob)
+        assert [math.isnan(v) for v in parsed] == [
+            math.isnan(v) for v in expected
+        ]
+        non_nan = [i for i, v in enumerate(parsed) if not math.isnan(v)]
+        assert [parsed[i] for i in non_nan] == [expected[i] for i in non_nan]
+
+
 def test_random_array_vectors_match_upstream():
     rng = random.Random(17)
     for name in ("Int24ub", "Int24sl", "Int32ub", "Int64sl"):
