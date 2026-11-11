@@ -213,7 +213,40 @@ These results target the workload this port is designed for. Small scalar
 schemas do not benefit from an FFI call, so their normal Python `struct`
 implementation is retained.
 
-No GPU path is included; all benchmarked codecs use the CPU.
+No GPU path is included; all benchmarked codecs use the CPU. GPU only: memory-bound (see the next section).
+
+### GPU phase
+
+CPU only: memory-bound.
+
+Every codec here was measured against the 2 flops/byte candidate gate and none
+of them is remotely close, so no GPU path was written and none was uploaded:
+
+| Kernel | bytes/element in | bytes/element out | arithmetic/element | flops/byte |
+|---|---:|---:|---:|---:|
+| parse/build 32-bit int (4 B -> 8 B buffer) | 4 | 8 | byte swap only | 0 |
+| parse/build 16-bit int | 2 | 8 | swap + sign extend | 0 |
+| parse/build Float64 | 8 | 8 | bit reinterpret (no FP math) | 0 |
+| build Float32 | 8 | 4 | FP64 -> FP32 narrow | ~0.15 |
+| build/parse varint | 1-10 | 8 | shift/or, data-dependent | ~0.1 |
+
+These are integer move-and-convert kernels: the work per element is a handful of
+shift/or instructions and there is no floating-point arithmetic at all. The
+arithmetic intensity is effectively zero (the only FP operation in the library is
+the double-to-float narrowing, about 1 op per 12 bytes copied), so the kernels are
+bound by memory bandwidth on the CPU already and would be bound by PCIe bandwidth
+on the GPU. There is nothing to compute that a device could do faster, and the
+transfer alone would cost more than the whole CPU kernel (0.5-2 ms at the sizes
+real callers pass; see the parallelism section for those sizes).
+
+On the pinned toolchain `from max.gpu import block_idx, thread_idx` and
+`from max.gpu.host import DeviceContext` both resolve (`MOJO_NOTES.md` section 5),
+so the host API is not the reason for skipping this phase; the gate is. At the
+time of this check the shared GPU reported 5500 MiB free, so the 4000 MiB limit
+was not the reason either.
+
+As a result there is no GPU test to skip: `pixi run test` runs the CPU suite only,
+and no test is marked or reported as skipped-on-CPU for this phase.
 
 ### Parallelism
 
