@@ -87,13 +87,13 @@ def encode_ints_range(
     var vector_end = end - (end - start) % W
     if stride == width and width == 1:
         while i < vector_end:
-            var values = src.load[width=W](i).cast[DType.uint8]()
+            var values = src.unsafe_load[width=W](i).cast[DType.uint8]()
             dst.store(i, values)
             i += W
     elif stride == width and width == 2:
         var target = dst.bitcast[UInt16]()
         while i < vector_end:
-            var values = src.load[width=W](i).cast[DType.uint16]()
+            var values = src.unsafe_load[width=W](i).cast[DType.uint16]()
             if big:
                 values = (values << 8) | (values >> 8)
             target.store(i, values)
@@ -101,7 +101,7 @@ def encode_ints_range(
     elif stride == width and width == 4:
         var target = dst.bitcast[UInt32]()
         while i < vector_end:
-            var values = src.load[width=W](i).cast[DType.uint32]()
+            var values = src.unsafe_load[width=W](i).cast[DType.uint32]()
             if big:
                 values = (
                     (values << 24)
@@ -114,7 +114,7 @@ def encode_ints_range(
     elif stride == width and width == 8:
         var target = dst.bitcast[UInt64]()
         while i < vector_end:
-            var values = src.load[width=W](i)
+            var values = src.unsafe_load[width=W](i)
             if big:
                 values = (
                     (values << 56)
@@ -152,7 +152,7 @@ def decode_ints(
         if width == 1:
             value = UInt64(p[0])
         elif width == 2:
-            var v = p.bitcast[UInt16]().load[alignment=1]()
+            var v = p.bitcast[UInt16]().unsafe_load[alignment=1]()
             value = UInt64(swap16(v) if big else v)
         elif width == 3:
             if big:
@@ -168,10 +168,10 @@ def decode_ints(
                     | (UInt64(p[2]) << 16)
                 )
         elif width == 4:
-            var v = p.bitcast[UInt32]().load[alignment=1]()
+            var v = p.bitcast[UInt32]().unsafe_load[alignment=1]()
             value = UInt64(swap32(v) if big else v)
         elif width == 8:
-            var v = p.bitcast[UInt64]().load[alignment=1]()
+            var v = p.bitcast[UInt64]().unsafe_load[alignment=1]()
             value = swap64(v) if big else v
         if signed and width < 8:
             var bits = UInt64(width * 8)
@@ -215,22 +215,22 @@ def decode_floats(
         var p = src + i * stride
         if width == 4:
             if big:
-                var raw = swap32(p.bitcast[UInt32]().load[alignment=1]())
+                var raw = swap32(p.bitcast[UInt32]().unsafe_load[alignment=1]())
                 scratch.bitcast[UInt32]()[0] = raw
                 dst[i] = Float64(
                     scratch.bitcast[Float32]()[0]
                 )
             else:
                 dst[i] = Float64(
-                    p.bitcast[Float32]().load[alignment=1]()
+                    p.bitcast[Float32]().unsafe_load[alignment=1]()
                 )
         elif width == 8:
             if big:
-                var raw = swap64(p.bitcast[UInt64]().load[alignment=1]())
+                var raw = swap64(p.bitcast[UInt64]().unsafe_load[alignment=1]())
                 scratch[0] = raw
                 dst[i] = scratch.bitcast[Float64]()[0]
             else:
-                dst[i] = p.bitcast[Float64]().load[alignment=1]()
+                dst[i] = p.bitcast[Float64]().unsafe_load[alignment=1]()
 
 
 @export("mc_encode_floats")
@@ -251,12 +251,12 @@ def encode_floats(
         if width == 4:
             p.bitcast[Float32]().store[alignment=1](0, Float32(src[i]))
             if big:
-                var raw = p.bitcast[UInt32]().load[alignment=1]()
+                var raw = p.bitcast[UInt32]().unsafe_load[alignment=1]()
                 p.bitcast[UInt32]().store[alignment=1](0, swap32(raw))
         elif width == 8:
             p.bitcast[Float64]().store[alignment=1](0, src[i])
             if big:
-                var raw = p.bitcast[UInt64]().load[alignment=1]()
+                var raw = p.bitcast[UInt64]().unsafe_load[alignment=1]()
                 p.bitcast[UInt64]().store[alignment=1](0, swap64(raw))
 
 
