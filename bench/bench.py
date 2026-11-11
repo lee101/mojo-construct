@@ -14,7 +14,7 @@ import construct as ref  # noqa: E402
 import mojo_construct as mc  # noqa: E402
 
 
-def best_time(fn, repeat=3):
+def best_time(fn, repeat=5):
     best = float("inf")
     result = None
     for _ in range(repeat):

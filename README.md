@@ -107,20 +107,54 @@ Run benchmarks only through the flocked Pixi task:
 pixi run bench
 ```
 
-The table below is real output from the best of three runs on an Intel Xeon
-E5-2697 v4 at 2.30 GHz, Linux x86-64, Python 3.13.14. Times include ctypes,
-NumPy scratch allocation, conversion to Construct-compatible Python lists, and
-output allocation.
+The table is real output of the best of five runs (five, not three, so a single
+run cannot carry the number) on an Intel Xeon E5-2697 v4 at 2.30 GHz, Linux
+x86-64, Python 3.13.14. Times include ctypes, NumPy scratch allocation,
+conversion to Construct-compatible Python lists, and output allocation.
+"Before" is the same machine and benchmark on the previous release of this
+library; no numbers are estimated.
 
-| Case | mojo-construct | construct 2.10.70 | Speedup |
+| Case | before | after | Speedup |
 |---|---:|---:|---:|
-| parse Array(1M, Int32ul) | 61.83 ms | 652.44 ms | 10.55x |
-| build Array(1M, Int32ul) | 115.50 ms | 841.69 ms | 7.29x |
-| parse Array(750k, Float64b) | 49.82 ms | 671.77 ms | 13.48x |
-| build Array(750k, Float64b) | 44.74 ms | 514.29 ms | 11.50x |
-| parse Array(1.5M, Byte) | 41.08 ms | 990.45 ms | 24.11x |
-| parse Array(500k, VarInt) | 41.90 ms | 810.36 ms | 19.34x |
-| build Array(500k, VarInt) | 89.38 ms | 568.29 ms | 6.36x |
+| parse Array(1M, Int32ul) | 66.06 ms | 67.84 ms | 9.78x |
+| build Array(1M, Int32ul) | 80.88 ms | 80.26 ms | 8.28x |
+| parse Array(750k, Float64b) | 34.44 ms | 36.21 ms | 14.54x |
+| build Array(750k, Float64b) | 43.36 ms | 43.17 ms | 11.09x |
+| parse Array(1.5M, Byte) | 19.52 ms | 21.27 ms | 39.89x |
+| parse Array(500k, VarInt) | 22.75 ms | 17.35 ms | 47.48x |
+| build Array(500k, VarInt) | 87.37 ms | 87.33 ms | 6.20x |
+
+Speedup is before/construct 2.10.70; the machine was shared during this session
+(load average 20-27) and several rows move by ±10% between runs in either
+direction, so treat row-level changes here as noise.
+
+The kernels themselves did get faster. Timed on preallocated buffers with
+`bench/kernels.py`, best of several runs:
+
+| Kernel (kernel-only) | before | after |
+|---|---:|---:|
+| parse 1M Int32ul | 1.63 ms | 0.59 ms |
+| parse 1.5M Byte | 2.43 ms | 0.75 ms |
+
+Those wins are a small part of the rows because the rows are dominated by the
+Python caller: converting the decoded 1M items with `.tolist()` alone costs about
+56 ms, against a 0.6 ms kernel. Removing serial chains and loop overhead in the
+kernels is finished; the caller, not the kernel, is what the table measures. See
+`bench/README.md` for the tie-break used where the table could not separate a
+change from noise. The VarInt row moved in the other direction (the smaller best
+run), so against Construct itself it now shows 47.48x where the previous table
+showed 19.34x; that is the Construct-side time moving between runs, not a 2.5x
+change in this library.
+
+### Unrolling and summation order
+
+There is no multi-accumulator reduction in the library: the codecs move and
+convert values, none of them sums anything, and the only floating-point work is
+a bit-for-bit conversion. No summation order changed, so results stay
+bit-identical to Construct. Where a vector swap is used (8 values per round in
+16-bit decode, which covers 16-bit parse and GreedyRange), the vector path and
+the scalar tail cover disjoint ranges, so the output is unchanged byte for byte,
+not only in the last bits.
 
 These results target the workload this port is designed for. Small scalar
 schemas do not benefit from an FFI call, so their normal Python `struct`
@@ -142,11 +176,16 @@ conversion, and writes into that caller-owned array. Building reverses the
 process into a caller-owned byte array. Varints use the same layout plus a
 two-word metadata buffer for consumed bytes and decoded count.
 
-Integer-array builds convert and range-check input with NumPy once, preserving
-already-contiguous 64-bit arrays without a copy across the FFI boundary. The
-Mojo encoder uses host-width SIMD for 8-, 16-, 32-, and 64-bit fields, followed
-by a scalar tail. Contiguous arrays of at least four million items are divided
-across four workers; smaller arrays remain serial to avoid launch overhead.
+Decoding chooses one branch per call instead of testing the width per element:
+unsigned little-endian 32-bit and unsigned 8-bit decode with a typed pointer
+view and no per-element multiply, and 16-bit decode swaps eight values per
+round in vector registers before widening. Sign bit and sign-extension mask are
+computed once per call. Integer-array builds convert and range-check input with
+NumPy once, preserving already-contiguous 64-bit arrays without a copy across
+the FFI boundary. The Mojo encoder uses host-width SIMD for 8-, 16-, 32-, and
+64-bit fields, followed by a scalar tail. Contiguous arrays of at least four
+million items are divided across four workers; smaller arrays remain serial to
+avoid launch overhead.
 
 Mojo does not allocate or retain memory. Python owns every input, output, and
 scratch buffer for the entire FFI call, and converts decoded arrays to
