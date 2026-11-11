@@ -15,6 +15,9 @@ PYTHONPATH = "python"
 
 [dependencies]
 mojo = "==1.2.0.dev2026092605"
+# Ships lib/mojo/{max,algorithm}.mojoc. MOJO_NOTES 5b: without it the
+# `max.algorithm` import fails. max-core (not `max`) keeps Python at 3.13.
+max-core = "==26.7.0.dev2026092605"
 python = "3.13.*"
 pytest = "*"
 numpy = "*"

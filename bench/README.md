@@ -4,6 +4,12 @@
 The scripts here are support tools, kept because they settle questions the table
 cannot.
 
+| Script | Settles |
+|---|---|
+| `kernels.py` | kernel time on preallocated buffers, for A/B of two builds |
+| `crossover.py` | kernel time across a size sweep (parallel threshold) |
+| `parallel_sweep.py` + `build_variants.sh` | serial vs 1/2/4/8 workers on real codecs |
+
 ## Why the table moves the kernel and barely the rows
 
 The table times the Python caller: list/NumPy conversion, ctypes, and
@@ -48,6 +54,17 @@ load average was 20-27 during the session, so the ranges are wide):
 | parse/build 750k Float64b | 0.57-0.92 ms | 0.57-1.06 ms |
 | parse 500k VarInt | 2.42-2.94 ms | 2.42-2.64 ms |
 | build 500k VarInt | 1.59-1.93 ms | 1.58-1.67 ms |
+## `parallel_sweep.py` and `build_variants.sh` - the parallelism experiment
+
+`build_variants.sh` compiles the codec library with the range split across a
+forced worker count (`pixi run bash bench/build_variants.sh 1:1024 2:1024 4:1024 8:1024`)
+and `parallel_sweep.py` times serial against each of those, checking every
+parallel result against the serial one as it goes. The result on this host is
+in the README: an empty `parallelize` call from a ctypes host costs ~5 ms, so
+the split loses below ~8M elements and gains only 1.2-1.3x at 16M. The path was
+reverted; the scripts stay so a toolchain with a cheaper launch can be measured
+the same way.
+
 ## Tie-break rule
 
 When `pixi run bench` cannot separate a change from run-to-run noise, keep the

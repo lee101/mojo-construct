@@ -421,6 +421,42 @@ def test_parallel_integer_encode_threshold_matches_expected_bytes():
         assert mc.Int32ul[count].build(values) == expected
 
 
+# The codecs are serial: splitting a range across max.algorithm workers was
+# measured against this host and lost even at 16M elements because a launch from
+# a ctypes host costs several milliseconds (README, "Parallelism"). Rather than
+# test a parallel path that is not there, pin that the scalar fallback of every
+# decode branch is reached: lengths below one SIMD vector, and lengths that are
+# one element off a vector multiple, must match a scalar reference exactly.
+SCALAR_ONLY_LENGTHS = [(1, width) for width in (1, 2, 3, 4, 8)] + [
+    (3, 1), (3, 2), (3, 8), (5, 2), (7, 4), (9, 8), (33, 1), (1001, 2),
+]
+
+
+@pytest.mark.parametrize("count,width", SCALAR_ONLY_LENGTHS)
+def test_serial_fallback_matches_scalar_reference(count, width):
+    rng = np.random.default_rng(count * 31 + width)
+    raw = rng.integers(0, 256, size=count * width, dtype=np.uint8)
+    for big in (False, True):
+        for signed in ((False, True) if width in (2, 3, 4) else (False,)):
+            got = _lib.decode_ints(raw, count, width, big=big, signed=signed)
+            if width == 3:
+                lanes = [raw[i * 3:i * 3 + 3].tolist() for i in range(count)]
+                ordered = [chunk[::-1] if big else chunk for chunk in lanes]
+                expected = []
+                for low, mid, high in ordered:
+                    value = low | (mid << 8) | (high << 16)
+                    if signed and value & 0x800000:
+                        value -= 1 << 24
+                    expected.append(value)
+            else:
+                order = ">" if big else "<"
+                kind = "i" if signed else "u"
+                expected = np.frombuffer(
+                    raw.tobytes(), dtype=f"{order}{kind}{width}"
+                ).astype(np.int64 if signed else np.uint64).tolist()
+            assert got.tolist() == expected
+
+
 def test_float_special_values_match_upstream():
     values = [float("-inf"), -0.0, 0.0, float("inf"), float("nan")]
     for name in ("Float32b", "Float32l", "Float64b", "Float64l"):

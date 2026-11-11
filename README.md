@@ -215,6 +215,102 @@ implementation is retained.
 
 No GPU path is included; all benchmarked codecs use the CPU.
 
+### Parallelism
+
+The codecs are serial, and that is a measured decision rather than an omission.
+`max.algorithm.parallelize` works on the pinned toolchain: the range split,
+the nested `def work(i: Int) {imm}:` worker and the explicit worker-count form
+all compile, and parallel output was bit-identical to serial in every case
+tested. It loses anyway, because of what a launch costs when the library is
+loaded through ctypes.
+
+Two measurements set the floor. An **empty** `parallelize` body called from
+ctypes costs **~5 ms per launch** (4.6-7.0 ms across repeat runs at load
+average 19-22); the same empty body called natively from a Mojo `main` costs
+**12-100 us**, which is the same work done through a different host. With four
+Python threads issuing calls concurrently, the in-library cost rose to
+**10-15 ms per call**. So the least a parallel codec can cost is several
+milliseconds before it processes a byte.
+
+Against that floor, the codec sweep (`bench/crossover.py`, serial) gives the
+crossover below which a launch can never pay for itself:
+
+| Kernel | serial @256k | @1024k | @4096k | @16384k |
+|---|---:|---:|---:|---:|
+| parse Int32ul | 0.16 ms | 0.67 ms | 4.64 ms | 25.33 ms |
+| build Int32ul | 0.13 ms | 0.48 ms | 3.60 ms | 22.96 ms |
+| parse Byte | 0.13 ms | 0.50 ms | 3.05 ms | 23.60 ms |
+| parse Float64b | 0.16 ms | 0.68 ms | 3.71 ms | 25.61 ms |
+| build Float64b | 0.18 ms | 0.70 ms | 7.03 ms | 30.07 ms |
+| parse VarInt | 1.27 ms | 5.16 ms | 21.14 ms | 84.12 ms |
+| build VarInt | 0.85 ms | 3.46 ms | 14.22 ms | 54.23 ms |
+
+Median of 15 runs in each of five rounds, load average 21.9. Every benchmark
+row (`bench/bench.py`) passes 500k-1.5M elements, where the serial kernel is
+0.5-5 ms. A parallel split there is a 5-10x *regression* of the kernel, which
+is why no threshold was shipped: the sizes real callers pass sit below the
+point where a launch could ever break even.
+
+The full experiment still ran to find that point.
+`bench/build_variants.sh` builds the library with the range split across 1, 2,
+4 and 8 workers at a forced threshold; `bench/parallel_sweep.py` A/Bs those
+against the serial build and checks the output of every worker count against
+the serial one. Median ms, speedup in parentheses:
+
+| parse Int32ul | serial | 1 worker | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|---:|
+| 256k | 0.15 | 0.15 (1.00x) | 4.96 (0.03x) | 4.85 (0.03x) | 4.94 (0.03x) |
+| 1024k | 0.56 | 0.56 (0.99x) | 5.44 (0.10x) | 5.44 (0.10x) | 4.99 (0.11x) |
+| 2048k | 1.17 | 1.24 (0.94x) | 6.45 (0.18x) | 5.52 (0.21x) | 5.61 (0.21x) |
+| 4096k | 6.04 | 4.94 (1.22x) | 9.63 (0.63x) | 8.27 (0.73x) | 7.95 (0.76x) |
+| 8192k | 12.02 | 11.48 (1.05x) | 12.94 (0.93x) | 11.87 (1.01x) | 12.13 (0.99x) |
+| 16384k | 24.17 | 24.29 (1.00x) | 22.79 (1.06x) | 18.69 (1.29x) | 19.46 (1.24x) |
+
+| parse Byte | serial | 1 | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|---:|
+| 1024k | 0.48 | 0.48 (1.00x) | 4.41 (0.11x) | 4.52 (0.11x) | 4.25 (0.11x) |
+| 8192k | 10.66 | 10.82 (0.98x) | 11.81 (0.90x) | 11.26 (0.95x) | 11.13 (0.96x) |
+| 16384k | 19.75 | 21.42 (0.92x) | 18.69 (1.06x) | 16.49 (1.20x) | 16.79 (1.18x) |
+
+| parse VarInt | serial | 1 | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|---:|
+| 1024k | 5.37 | 5.18 (1.04x) | 5.17 (1.04x) | 5.28 (1.02x) | 6.77 (0.79x) |
+| 8192k | 43.26 | 42.56 (1.02x) | 43.05 (1.00x) | 42.69 (1.01x) | 42.11 (1.03x) |
+| 16384k | 83.45 | 84.60 (0.99x) | 86.57 (0.96x) | 83.56 (1.00x) | 84.97 (0.98x) |
+
+Build Int32ul, both float codecs and build VarInt are in the same table in
+`bench/parallel_sweep.py`; none of them gained more than 1.07x at any size.
+Load average was 18.3 during this sweep.
+
+What that says:
+
+- At 1M-2M elements, 2-8 workers cost **3-30x** the serial time. This is the
+  range the benchmark and ordinary `Array`/`GreedyRange` callers use.
+- The crossover for parse is ~8M elements, and only at 16M does 4 workers
+  reach a real gain: **1.29x** for parse Int32ul, **1.20x** for parse Byte.
+  Everything else at that size is within noise or slower.
+- The gain **flattens and reverses** going from 4 to 8 workers (1.29x -> 1.24x
+  for parse Int32ul, 1.20x -> 1.18x for parse Byte) on this shared host, so the
+  4-worker cap is where it stops, not where it is optimal.
+- One worker shows up to 1.22x at 4096k, which is noise: with one worker
+  `parallelize` runs the range inline and nothing is split.
+
+A threshold of 8M-16M elements with four workers would therefore be
+serial at every size a real caller passes and only parallel where a single
+launch consumes tens of milliseconds anyway. That is not worth shipping: it
+puts worker threads inside whatever process loads the library (where the
+concurrency measurement above shows launches become 2-3x more expensive), for
+a 1.2-1.3x kernel gain at 8M-16M elements, against benchmark rows of 0.5M-1.5M.
+At 16M a 25 ms kernel would come out ~6 ms faster, but no benchmark row is that
+size, and 6 ms out of a 64 ms caller-dominated row is not a measurable win. The
+range split was reverted and the codecs stay serial. The one structural change
+kept from the experiment is that `decode_ints` now calls a `decode_ints_range`
+with an explicit `[start, end)`, so a future toolchain with a cheaper launch can
+re-enable it without touching the vector loops. The refactor itself is checked:
+786 input/layout cases across the pre-experiment and current builds produce
+identical bytes, and `test_serial_fallback_matches_scalar_reference` pins the
+scalar paths.
+
 ## How it works
 
 `src/construct.mojo` is one compilation unit exporting six non-parametric C ABI
@@ -237,9 +333,9 @@ and reinterprets (or widens) in registers and writes each element once. Sign bit
 and sign-extension mask are computed once per call. Integer-array builds convert and range-check input with
 NumPy once, preserving already-contiguous 64-bit arrays without a copy across
 the FFI boundary. The Mojo encoder uses host-width SIMD for 8-, 16-, 32-, and
-64-bit fields, followed by a scalar tail. Contiguous arrays of at least four
-million items are divided across four workers; smaller arrays remain serial to
-avoid launch overhead.
+64-bit fields, followed by a scalar tail. Every codec runs on one thread; the
+section below records why dividing the range across `max.algorithm` workers was
+measured and rejected on this toolchain.
 
 Mojo does not allocate or retain memory. Python owns every input, output, and
 scratch buffer for the entire FFI call, and converts decoded arrays to

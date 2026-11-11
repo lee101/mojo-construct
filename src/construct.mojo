@@ -156,20 +156,16 @@ def encode_ints(
     encode_ints_range(src, dst, 0, count, width, stride, big)
 
 
-@export("mc_decode_ints")
-def decode_ints(
-    src_addr: Int,
-    dst_addr: Int,
-    count: Int,
+def decode_ints_range(
+    src: BPtr,
+    dst: U64Ptr,
+    start: Int,
+    end: Int,
     width: Int,
     stride: Int,
     big: Int,
     signed: Int,
-) abi("C"):
-    if count <= 0:
-        return
-    var src = BPtr(unsafe_from_address=src_addr)
-    var dst = U64Ptr(unsafe_from_address=dst_addr)
+):
     # Sign bit and sign-extension mask, computed once instead of per element.
     var sign_bit = UInt64(0) if not signed or width == 8 else (
         UInt64(1) << UInt64(width * 8 - 1)
@@ -177,33 +173,33 @@ def decode_ints(
     var sign_mask = UInt64(0) if not signed or width == 8 else ~(
         (UInt64(1) << UInt64(width * 8)) - UInt64(1)
     )
-    var i = 0
+    var i = start
     comptime W = simd_width_of[DType.uint64]()
     if width == 4 and not big and not signed and stride == width:
         # Little-endian 32-bit unsigned: widen straight into 64-bit lanes.
         var source = src.bitcast[UInt32]()
-        var vector_end = count - count % W
+        var vector_end = end - (end - start) % W
         while i < vector_end:
             dst.store(i, source.unsafe_load[width=W, alignment=1](i).cast[DType.uint64]())
             i += W
-        while i < count:
+        while i < end:
             dst.store(i, UInt64(source.unsafe_load[alignment=1](i)))
             i += 1
     elif width == 1 and not signed and stride == width:
         # Byte arrays: the element address is the index, so no multiply. Widen
         # W bytes per vector round and store one vector of 64-bit lanes.
-        var vector_end = count - count % W
+        var vector_end = end - (end - start) % W
         while i < vector_end:
             dst.store(i, src.unsafe_load[width=W](i).cast[DType.uint64]())
             i += W
-        while i < count:
+        while i < end:
             dst.store(i, UInt64(src.unsafe_load(i)))
             i += 1
     elif width == 2 and stride == width:
         # Swap and widen W values per round in vector registers: the widening
         # happens on the vector, not lane by lane as before.
         var source = src.bitcast[UInt16]()
-        var vector_end = count - count % W
+        var vector_end = end - (end - start) % W
         var low_mask = SIMD[DType.uint64, W](sign_mask)
         while i < vector_end:
             var v = source.unsafe_load[width=W, alignment=1](i)
@@ -220,14 +216,14 @@ def decode_ints(
                 wide |= negative & low_mask
             dst.store(i, wide)
             i += W
-        while i < count:
+        while i < end:
             var v = src.bitcast[UInt16]().unsafe_load[alignment=1](i)
             if big:
                 v = swap16(v)
             dst.unsafe_store(i, extend16(v, signed, sign_bit, sign_mask))
             i += 1
     else:
-        for j in range(count):
+        for j in range(start, end):
             var p = src + j * stride
             var value = UInt64(0)
             if width == 1:
@@ -258,6 +254,23 @@ def decode_ints(
             if signed and width < 8 and value & sign_bit:
                 value |= sign_mask
             dst.unsafe_store(j, value)
+
+
+@export("mc_decode_ints")
+def decode_ints(
+    src_addr: Int,
+    dst_addr: Int,
+    count: Int,
+    width: Int,
+    stride: Int,
+    big: Int,
+    signed: Int,
+) abi("C"):
+    if count <= 0:
+        return
+    var src = BPtr(unsafe_from_address=src_addr)
+    var dst = U64Ptr(unsafe_from_address=dst_addr)
+    decode_ints_range(src, dst, 0, count, width, stride, big, signed)
 
 
 @export("mc_decode_floats")
